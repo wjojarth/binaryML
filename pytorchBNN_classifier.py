@@ -5,9 +5,10 @@ import numpy as np
 from skimage.draw import disk
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
+from sympy import symbols, And, Or, Not, simplify_logic
+from itertools import product
 
-# -------------------- Binary Ops --------------------
-
+# Your original BNN code (unchanged)
 class SignSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
@@ -21,8 +22,6 @@ class SignSTE(torch.autograd.Function):
 def binarize(x):
     return SignSTE.apply(x)
 
-# -------------------- Binary Linear Layer --------------------
-
 class BinaryLinear(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
@@ -32,8 +31,6 @@ class BinaryLinear(nn.Module):
     def forward(self, x):
         bin_w = binarize(self.weight)
         return F.linear(x, bin_w, self.bias)
-
-# -------------------- XNOR Classifier --------------------
 
 class XNORClassifier(nn.Module):
     def __init__(self, inference_mode=False):
@@ -49,11 +46,9 @@ class XNORClassifier(nn.Module):
         x = binarize(self.fc2(x))
         x = self.fc3(x)
         if self.inference_mode:
-            return x.sign()  # 1 or -1
+            return x.sign()
         else:
-            return torch.sigmoid(x)  # For BCE training
-
-# -------------------- Dataset --------------------
+            return torch.sigmoid(x)
 
 class CanvasDataset(Dataset):
     def __init__(self, n=1000, size=16, fixed_shape=None):
@@ -80,17 +75,145 @@ class CanvasDataset(Dataset):
     def __getitem__(self, i):
         return self.X[i], self.y[i]
 
-# -------------------- Training --------------------
+# NEW: BNN to Boolean Logic Converter
+class BNNToLogic:
+    def __init__(self, model):
+        self.model = model
+        self.model.eval()
+        self.model.inference_mode = True
+        
+    def extract_binary_weights(self):
+        """Extract binarized weights from trained model"""
+        weights = {}
+        with torch.no_grad():
+            # Layer 1: 256 -> 128
+            w1 = torch.sign(self.model.fc1.weight).int()  # 128 x 256
+            b1 = self.model.fc1.bias
+            weights['layer1'] = {'weight': w1, 'bias': b1}
+            
+            # Layer 2: 128 -> 64  
+            w2 = torch.sign(self.model.fc2.weight).int()  # 64 x 128
+            b2 = self.model.fc2.bias
+            weights['layer2'] = {'weight': w2, 'bias': b2}
+            
+            # Layer 3: 64 -> 1
+            w3 = torch.sign(self.model.fc3.weight).int()  # 1 x 64
+            b3 = self.model.fc3.bias
+            weights['layer3'] = {'weight': w3, 'bias': b3}
+            
+        return weights
+    
+    def simulate_layer(self, inputs, weight, bias):
+        """Simulate one binary layer using XNOR operations"""
+        # inputs: binary tensor
+        # weight: binary weight matrix
+        outputs = []
+        
+        for neuron_weights in weight:
+            # XNOR operation: ~(input XOR weight) 
+            xnor_result = ~(inputs ^ neuron_weights)
+            # Count 1s (popcount)
+            popcount = xnor_result.sum().item()
+            # Apply threshold (bias determines threshold)
+            output = 1 if popcount > (len(inputs) / 2 + bias) else -1
+            outputs.append(output)
+            
+        return torch.tensor(outputs, dtype=torch.int)
+    
+    def generate_truth_table(self, input_size=8):
+        """Generate truth table for first 8 inputs (for demonstration)"""
+        weights = self.extract_binary_weights()
+        truth_table = {}
+        
+        print(f"Generating truth table for {input_size} inputs...")
+        
+        for i in range(2**input_size):
+            # Create input pattern (only first input_size bits)
+            input_pattern = torch.zeros(256, dtype=torch.int)
+            for bit in range(input_size):
+                input_pattern[bit] = 1 if (i >> (input_size-1-bit)) & 1 else -1
+            
+            # Forward pass through network
+            x = input_pattern.float()
+            with torch.no_grad():
+                output = self.model(x.unsqueeze(0)).item()
+                binary_output = 1 if output > 0 else 0
+                
+            truth_table[i] = binary_output
+            
+        return truth_table
+    
+    def create_boolean_expression(self, truth_table, input_size=8):
+        """Convert truth table to simplified Boolean expression"""
+        # Create symbolic variables
+        vars = symbols(f'x0:{input_size}')
+        
+        # Find minterms where output is 1
+        minterms = []
+        for input_val, output in truth_table.items():
+            if output == 1:
+                # Create minterm for this input combination
+                literals = []
+                for bit in range(input_size):
+                    bit_val = (input_val >> (input_size-1-bit)) & 1
+                    if bit_val:
+                        literals.append(vars[bit])
+                    else:
+                        literals.append(Not(vars[bit]))
+                minterms.append(And(*literals))
+        
+        if not minterms:
+            return False  # Always false
+        
+        # Combine minterms with OR
+        boolean_expr = Or(*minterms)
+        
+        # Simplify the expression
+        simplified = simplify_logic(boolean_expr, form='dnf')
+        
+        return simplified
+    
+    def count_gates(self, expr):
+        """Count the number of logic gates in the expression"""
+        if expr in [True, False]:
+            return {"AND": 0, "OR": 0, "NOT": 0, "TOTAL": 0}
+            
+        counts = {"AND": 0, "OR": 0, "NOT": 0}
+        
+        def count_recursive(e):
+            if isinstance(e, Or):
+                counts["OR"] += len(e.args) - 1 if len(e.args) > 1 else 0
+                for arg in e.args:
+                    count_recursive(arg)
+            elif isinstance(e, And):
+                counts["AND"] += len(e.args) - 1 if len(e.args) > 1 else 0
+                for arg in e.args:
+                    count_recursive(arg)
+            elif isinstance(e, Not):
+                counts["NOT"] += 1
+                count_recursive(e.args[0])
+        
+        count_recursive(expr)
+        counts["TOTAL"] = sum(counts.values())
+        return counts
 
-def train(model, dataloader, epochs=10, lr=1e-3):
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+def demonstrate_simplification():
+    """Train a model and demonstrate Boolean simplification"""
+    print("Training BNN...")
+    torch.manual_seed(42)
+    
+    # Train the model
+    ds = CanvasDataset(n=500)
+    dl = DataLoader(ds, batch_size=32, shuffle=True)
+    model = XNORClassifier(inference_mode=False)
+    
+    # Quick training
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.BCELoss()
     model.train()
-
-    for epoch in range(epochs):
-        total_loss = 0
-        correct = 0
-        for xb, yb in dataloader:
+    
+    for epoch in range(10):  # Reduced epochs for demo
+        for xb, yb in dl:
             xb = xb.float()
             yb = yb.float().unsqueeze(1)
             preds = model(xb)
@@ -98,49 +221,50 @@ def train(model, dataloader, epochs=10, lr=1e-3):
             opt.zero_grad()
             loss.backward()
             opt.step()
-
-            total_loss += loss.item()
-            correct += ((preds > 0.5).float() == yb).sum().item()
-        acc = correct / len(dataloader.dataset)
-        print(f"Epoch {epoch+1}: Loss = {total_loss/len(dataloader):.4f}, Acc = {acc:.3f}")
-
-# -------------------- Inference --------------------
-
-def show_canvas(canvas, title=""):
-    plt.imshow(canvas.reshape(16, 16), cmap='gray')
-    plt.axis('off')
-    plt.title(title)
-    plt.show()
-
-def evaluate(model, label_name, label_val, display=False):
-    test_ds = CanvasDataset(n=100, fixed_shape=label_name)
-    correct = 0
-    model.inference_mode = True
-    model.eval()
-    with torch.no_grad():
-        for i in range(len(test_ds)):
-            x, y_true = test_ds[i]
-            x = x.unsqueeze(0)
-            pred = model(x.float()).item()
-            pred_label = 1 if pred > 0 else 0
-            if pred_label == y_true.item():
-                correct += 1
-            if display and i < 5:
-                label_str = "circle" if pred_label == 1 else "rectangle"
-                truth_str = "circle" if y_true.item() == 1 else "rectangle"
-                show_canvas(x.squeeze().numpy(), title=f"Pred: {label_str} / True: {truth_str}")
-    print(f"{label_name.capitalize()} Test Accuracy: {correct}/100 = {correct/100:.2f}")
-
-# -------------------- Run Everything --------------------
+    
+    print("Converting to Boolean logic...")
+    
+    # Convert to Boolean logic
+    converter = BNNToLogic(model)
+    
+    # Generate truth table for first 8 inputs
+    truth_table = converter.generate_truth_table(input_size=8)
+    
+    # Create Boolean expression
+    boolean_expr = converter.create_boolean_expression(truth_table, input_size=8)
+    
+    # Count gates
+    gate_counts = converter.count_gates(boolean_expr)
+    
+    print(f"\n=== Results ===")
+    print(f"Original BNN parameters: {sum(p.numel() for p in model.parameters())}")
+    print(f"Truth table entries: {len(truth_table)}")
+    print(f"Simplified Boolean expression:")
+    print(f"  {boolean_expr}")
+    print(f"\nGate counts:")
+    for gate_type, count in gate_counts.items():
+        print(f"  {gate_type}: {count}")
+    
+    # Test a few examples
+    print(f"\n=== Verification ===")
+    vars = symbols('x0:8')
+    for test_val in [5, 10, 15, 20]:
+        if test_val < 256:  # Within our truth table
+            # Original model prediction
+            test_input = torch.zeros(256)
+            for bit in range(8):
+                test_input[bit] = 1 if (test_val >> (7-bit)) & 1 else -1
+            
+            with torch.no_grad():
+                model_output = model(test_input.unsqueeze(0)).item() > 0
+            
+            # Boolean expression evaluation
+            bit_values = {vars[i]: bool((test_val >> (7-i)) & 1) for i in range(8)}
+            bool_output = bool(boolean_expr.subs(bit_values))
+            
+            print(f"Input {test_val:3d}: Model={model_output}, Boolean={bool_output}, Match={model_output==bool_output}")
+    
+    return model, boolean_expr, gate_counts
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
-    ds = CanvasDataset(n=500)
-    dl = DataLoader(ds, batch_size=32, shuffle=True)
-
-    model = XNORClassifier(inference_mode=False)
-    train(model, dl, epochs=20)
-
-    print("\n=== Inference with Hard Binary Output ===")
-    #evaluate(model, "circle", 1, display=True)
-    evaluate(model, "rect", 0, display=True)
+    model, expr, counts = demonstrate_simplification()
